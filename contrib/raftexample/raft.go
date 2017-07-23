@@ -40,7 +40,7 @@ import (
 type raftNode struct {
 	proposeC    <-chan string            // proposed messages (k,v)
 	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
-	commitC     chan<- *string           // entries committed to log (k,v)
+	commitC     chan<- *raftCommit       // entries committed to log (k,v)
 	errorC      chan<- error             // errors from raft session
 
 	id          int      // client ID for raft session
@@ -48,7 +48,7 @@ type raftNode struct {
 	join        bool     // node is joining an existing cluster
 	waldir      string   // path to WAL directory
 	snapdir     string   // path to snapshot directory
-	getSnapshot func() ([]byte, error)
+	getSnapshot func(uint64) ([]byte, error)
 	lastIndex   uint64 // index of log at start
 
 	confState     raftpb.ConfState
@@ -70,17 +70,32 @@ type raftNode struct {
 	httpdonec chan struct{} // signals http server shutdown complete
 }
 
-var defaultSnapCount uint64 = 10000
+var defaultSnapCount uint64 = 3
+
+type raftCommitType uint
+
+type raftCommit struct {
+	Index uint64
+	Type  raftCommitType
+	Data  []byte
+}
+
+const (
+	raftCommitEntry          raftCommitType = 0
+	raftCommitLoadSnapshot                  = 1
+	raftCommitReplayFinished                = 2
+	raftCommitUpdateIndex                   = 3
+)
 
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
-	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error, <-chan *snap.Snapshotter) {
+func newRaftNode(id int, peers []string, join bool, getSnapshot func(uint64) ([]byte, error), proposeC <-chan string,
+	confChangeC <-chan raftpb.ConfChange) (<-chan *raftCommit, <-chan error, <-chan *snap.Snapshotter) {
 
-	commitC := make(chan *string)
+	commitC := make(chan *raftCommit)
 	errorC := make(chan error)
 
 	rc := &raftNode{
@@ -147,9 +162,12 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 				// ignore empty messages
 				break
 			}
-			s := string(ents[i].Data)
 			select {
-			case rc.commitC <- &s:
+			case rc.commitC <- &raftCommit{
+				Type:  raftCommitEntry,
+				Index: ents[i].Index,
+				Data:  ents[i].Data,
+			}:
 			case <-rc.stopc:
 				return false
 			}
@@ -178,7 +196,8 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 		// special nil commit to signal replay has finished
 		if ents[i].Index == rc.lastIndex {
 			select {
-			case rc.commitC <- nil:
+			case rc.commitC <- &raftCommit{Type: raftCommitReplayFinished}:
+				log.Printf("finished replaying. last index is %d\n", rc.lastIndex)
 			case <-rc.stopc:
 				return false
 			}
@@ -243,7 +262,7 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 	if len(ents) > 0 {
 		rc.lastIndex = ents[len(ents)-1].Index
 	} else {
-		rc.commitC <- nil
+		rc.commitC <- &raftCommit{Type: raftCommitReplayFinished}
 	}
 	return w
 }
@@ -336,14 +355,16 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	if snapshotToSave.Metadata.Index <= rc.appliedIndex {
 		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d] + 1", snapshotToSave.Metadata.Index, rc.appliedIndex)
 	}
-	rc.commitC <- nil // trigger kvstore to load snapshot
+	rc.commitC <- &raftCommit{Type: raftCommitLoadSnapshot} // trigger kvstore to load snapshot
 
 	rc.confState = snapshotToSave.Metadata.ConfState
 	rc.snapshotIndex = snapshotToSave.Metadata.Index
 	rc.appliedIndex = snapshotToSave.Metadata.Index
+
+	rc.commitC <- &raftCommit{Type: raftCommitUpdateIndex, Index: rc.appliedIndex}
 }
 
-var snapshotCatchUpEntriesN uint64 = 10000
+var snapshotCatchUpEntriesN uint64 = 3
 
 func (rc *raftNode) maybeTriggerSnapshot() {
 	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
@@ -351,7 +372,8 @@ func (rc *raftNode) maybeTriggerSnapshot() {
 	}
 
 	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
-	data, err := rc.getSnapshot()
+
+	data, err := rc.getSnapshot(rc.appliedIndex)
 	if err != nil {
 		log.Panic(err)
 	}

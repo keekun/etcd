@@ -16,7 +16,9 @@ package main
 
 import (
 	"flag"
+	"log"
 	"strings"
+	"time"
 
 	"github.com/coreos/etcd/raft/raftpb"
 )
@@ -35,7 +37,16 @@ func main() {
 
 	// raft provides a commit stream for the proposals from the http api
 	var kvs *kvstore
-	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
+	getSnapshot := func(appliedIndex uint64) ([]byte, error) {
+		for {
+			if kvs.committedIndex == appliedIndex { // wait for all wal to apply
+				log.Printf("all commits applied. appliedIndex: %d", appliedIndex)
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return kvs.getSnapshot()
+	}
 	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
 
 	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
